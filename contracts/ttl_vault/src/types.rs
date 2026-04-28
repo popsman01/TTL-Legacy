@@ -8,6 +8,9 @@ pub const WITHDRAW_TOPIC: Symbol = symbol_short!("withdraw");
 pub const CHECK_IN_TOPIC: Symbol = symbol_short!("check_in");
 pub const CANCEL_TOPIC: Symbol = symbol_short!("cancel");
 pub const OWNERSHIP_TOPIC: Symbol = symbol_short!("own_xfer");
+pub const OWNERSHIP_INITIATED_TOPIC: Symbol = symbol_short!("own_init");
+pub const OWNERSHIP_ACCEPTED_TOPIC: Symbol = symbol_short!("own_acc");
+pub const OWNERSHIP_CANCELLED_TOPIC: Symbol = symbol_short!("own_can");
 pub const BENEFICIARY_UPDATED_TOPIC: Symbol = symbol_short!("ben_upd");
 pub const SET_BENEFICIARIES_TOPIC: Symbol = symbol_short!("set_bens");
 pub const UPDATE_INTERVAL_TOPIC: Symbol = symbol_short!("upd_intv");
@@ -79,6 +82,7 @@ pub enum DataKey {
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
+    PendingOwnership(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -252,4 +256,17 @@ pub struct WithdrawalScheduleEntry {
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
+}
+
+/// Pending ownership transfer request with time-lock.
+/// The new owner must call `accept_ownership_transfer` after `unlocks_at` to complete the transfer.
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipTransferRequest {
+    /// The proposed new owner address.
+    pub new_owner: Address,
+    /// Unix timestamp when the new owner is allowed to accept (time-lock expiry).
+    pub unlocks_at: u64,
+    /// Unix timestamp after which the request expires and must be re-initiated.
+    pub expires_at: u64,
 }

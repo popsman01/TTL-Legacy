@@ -9,6 +9,7 @@ mod types;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
+    OwnershipTransferRequest,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -18,7 +19,8 @@ use types::{
     INHERITANCE_TOPIC, ADD_PASSKEY_TOPIC, REMOVE_PASSKEY_TOPIC, ROTATE_PASSKEY_TOPIC,
     BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, DELEGATE_BENEFICIARY_TOPIC,
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
-    CONDITIONS_ACCEPTED_TOPIC,
+    CONDITIONS_ACCEPTED_TOPIC, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
+    OWNERSHIP_CANCELLED_TOPIC,
 };
 
 #[cfg(test)]
@@ -49,6 +51,14 @@ pub const INSTANCE_TTL_LEDGERS: u32 = 200_000;
 const LEDGER_SECOND: u32 = 5;
 /// Soroban maximum persistent entry TTL in ledgers (~180 days at 5s/ledger).
 const MAX_PERSISTENT_TTL: u32 = 3_110_400;
+
+/// Time-lock delay for ownership transfers in seconds (24 hours).
+/// The new owner cannot accept until this many seconds have elapsed after initiation.
+const OWNERSHIP_TRANSFER_TIMELOCK: u64 = 86_400;
+
+/// Expiry window for pending ownership transfer requests in seconds (7 days).
+/// If the new owner does not accept within this window, the request expires.
+const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -97,6 +107,9 @@ pub enum ContractError {
     DisputeFiled = 31,
     NoScheduledWithdrawals = 32,
     ConditionsNotApproved = 33,
+    NoPendingOwnershipTransfer = 34,
+    OwnershipTransferExpired = 35,
+    OwnershipTransferTimeLocked = 36,
 }
 
 #[contract]
@@ -2298,60 +2311,201 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Transfers ownership of a vault to a new address.
+    /// Initiates a vault ownership transfer to a new address.
     ///
-    /// Both the current owner and new owner must authorize this operation.
-    /// The vault must still be in Locked status.
+    /// This is step 1 of a 2-step ownership transfer with a 24-hour time-lock.
+    /// The new owner must call `accept_ownership_transfer` after the time-lock
+    /// expires to complete the transfer. The request expires after 7 days if
+    /// not accepted.
+    ///
+    /// Only one pending transfer can exist per vault at a time. Calling this
+    /// again replaces any existing pending request.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The unique identifier of the vault
-    /// * `new_owner` - The address of the new owner (must authorize)
+    /// * `caller` - The current owner (must authorize)
+    /// * `new_owner` - The proposed new owner address
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err` on failure
+    /// `Ok(unlocks_at)` — the timestamp when the new owner may accept
     ///
     /// # Errors
     /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
     /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
-    pub fn transfer_ownership(
-            env: Env,
-            vault_id: u64,
-            caller: Address,
-            new_owner: Address,
-        ) -> Result<(), ContractError> {
-            if Self::load_paused(&env) {
-                return Err(ContractError::Paused);
-            }
-            caller.require_auth();
-            let mut vault = Self::load_vault(&env, vault_id);
-            let old_owner = vault.owner.clone();
-            if caller != old_owner {
-                return Err(ContractError::NotOwner);
-            }
-            if vault.status != ReleaseStatus::Locked {
-                return Err(ContractError::AlreadyReleased);
-            }
-            // Invariant: owner and beneficiary must always be distinct addresses.
-            // BeneficiaryVaults is keyed by beneficiary address. Because ownership
-            // transfer never changes vault.beneficiary, the index requires no update:
-            // the existing entry (beneficiary → vault_id) remains valid. Any other
-            // vaults where new_owner appears as a beneficiary are unrelated entries
-            // in the index and are also unaffected.
-            if new_owner == vault.beneficiary {
-                return Err(ContractError::InvalidBeneficiary);
-            }
-            if old_owner != new_owner {
-                Self::remove_owner_vault_id(&env, &old_owner, vault_id, vault.check_in_interval);
-                Self::add_owner_vault_id(&env, &new_owner, vault_id, vault.check_in_interval);
-            }
-            vault.owner = new_owner.clone();
-            Self::save_vault(&env, vault_id, &vault);
-            Self::log_audit_entry(&env, vault_id, "transfer_ownership", &caller, "");
-            env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-            env.events().publish((OWNERSHIP_TOPIC, vault_id), (old_owner, new_owner));
-            Ok(())
+    /// * `ContractError::InvalidBeneficiary` - If new_owner equals the vault beneficiary
+    pub fn initiate_ownership_transfer(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        new_owner: Address,
+    ) -> Result<u64, ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
         }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if new_owner == vault.beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let now = env.ledger().timestamp();
+        let unlocks_at = now + OWNERSHIP_TRANSFER_TIMELOCK;
+        let expires_at = now + OWNERSHIP_TRANSFER_EXPIRY;
+
+        let request = OwnershipTransferRequest {
+            new_owner: new_owner.clone(),
+            unlocks_at,
+            expires_at,
+        };
+        let key = DataKey::PendingOwnership(vault_id);
+        env.storage().persistent().set(&key, &request);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, vault_ttl_ledgers(vault.check_in_interval));
+
+        Self::log_audit_entry(&env, vault_id, "initiate_ownership_transfer", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((OWNERSHIP_INITIATED_TOPIC, vault_id), (caller, new_owner, unlocks_at));
+        Ok(unlocks_at)
+    }
+
+    /// Accepts a pending ownership transfer (step 2).
+    ///
+    /// The new owner calls this after the 24-hour time-lock has passed.
+    /// On success, vault ownership is transferred immediately.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `new_owner` - The new owner accepting the transfer (must authorize)
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NoPendingOwnershipTransfer` - If no pending request exists
+    /// * `ContractError::NotOwner` - If caller is not the designated new owner
+    /// * `ContractError::OwnershipTransferTimeLocked` - If the time-lock has not yet elapsed
+    /// * `ContractError::OwnershipTransferExpired` - If the request has expired
+    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    pub fn accept_ownership_transfer(
+        env: Env,
+        vault_id: u64,
+        new_owner: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        new_owner.require_auth();
+
+        let key = DataKey::PendingOwnership(vault_id);
+        let request = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OwnershipTransferRequest>(&key)
+            .ok_or(ContractError::NoPendingOwnershipTransfer)?;
+
+        if new_owner != request.new_owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < request.unlocks_at {
+            return Err(ContractError::OwnershipTransferTimeLocked);
+        }
+        if now > request.expires_at {
+            return Err(ContractError::OwnershipTransferExpired);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let old_owner = vault.owner.clone();
+        if old_owner != new_owner {
+            Self::remove_owner_vault_id(&env, &old_owner, vault_id, vault.check_in_interval);
+            Self::add_owner_vault_id(&env, &new_owner, vault_id, vault.check_in_interval);
+        }
+        vault.owner = new_owner.clone();
+        Self::save_vault(&env, vault_id, &vault);
+
+        // Clear the pending request
+        env.storage().persistent().remove(&key);
+
+        Self::log_audit_entry(&env, vault_id, "accept_ownership_transfer", &new_owner, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((OWNERSHIP_ACCEPTED_TOPIC, vault_id), (old_owner.clone(), new_owner.clone()));
+        // Backwards-compatible event for consumers watching OWNERSHIP_TOPIC
+        env.events().publish((OWNERSHIP_TOPIC, vault_id), (old_owner, new_owner));
+        Ok(())
+    }
+
+    /// Cancels a pending ownership transfer.
+    ///
+    /// Only the current vault owner can cancel. This removes the pending request
+    /// and the proposed new owner can no longer accept.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `caller` - The current owner (must authorize)
+    ///
+    /// # Returns
+    /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::NoPendingOwnershipTransfer` - If no pending request exists
+    pub fn cancel_ownership_transfer(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::PendingOwnership(vault_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::NoPendingOwnershipTransfer);
+        }
+        let request = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OwnershipTransferRequest>(&key)
+            .unwrap();
+        let cancelled_new_owner = request.new_owner.clone();
+        env.storage().persistent().remove(&key);
+
+        Self::log_audit_entry(&env, vault_id, "cancel_ownership_transfer", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((OWNERSHIP_CANCELLED_TOPIC, vault_id), (caller, cancelled_new_owner));
+        Ok(())
+    }
+
+    /// Returns the pending ownership transfer request for a vault, if any.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// `Some(OwnershipTransferRequest)` if a pending transfer exists, `None` otherwise
+    pub fn get_pending_ownership_transfer(env: Env, vault_id: u64) -> Option<OwnershipTransferRequest> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, OwnershipTransferRequest>(&DataKey::PendingOwnership(vault_id))
+    }
 
     // --- Issue #378: Vault Metadata ---
 
