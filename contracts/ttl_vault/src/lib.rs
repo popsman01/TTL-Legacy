@@ -19,7 +19,7 @@ use types::{
     INHERITANCE_TOPIC, ADD_PASSKEY_TOPIC, REMOVE_PASSKEY_TOPIC, ROTATE_PASSKEY_TOPIC,
     BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, DELEGATE_BENEFICIARY_TOPIC,
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
-    CONDITIONS_ACCEPTED_TOPIC, VAULT_CLONED_TOPIC,
+    CONDITIONS_ACCEPTED_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
 };
 
 #[cfg(test)]
@@ -3033,6 +3033,65 @@ impl TtlVaultContract {
         Self::append_activity_log(&env, new_vault_id, "clone_vault", &new_owner, "");
         env.events().publish((VAULT_CLONED_TOPIC,), (source_vault_id, new_vault_id, new_beneficiary));
         new_vault_id
+    }
+
+    /// Merges multiple source vaults into a target vault.
+    ///
+    /// All vaults must share the same owner and token_address. Source vault balances
+    /// are transferred to the target vault and sources are marked Cancelled.
+    pub fn merge_vaults(
+        env: Env,
+        target_vault_id: u64,
+        source_vault_ids: Vec<u64>,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let target = Self::load_vault(&env, target_vault_id);
+        if caller != target.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if target.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        // Validate all sources before mutating state
+        for source_id in source_vault_ids.iter() {
+            if source_id == target_vault_id {
+                return Err(ContractError::InvalidAmount);
+            }
+            let source = Self::load_vault(&env, source_id);
+            if source.owner != target.owner {
+                return Err(ContractError::NotOwner);
+            }
+            if source.token_address != target.token_address {
+                return Err(ContractError::InvalidAmount);
+            }
+            if source.status != ReleaseStatus::Locked {
+                return Err(ContractError::AlreadyReleased);
+            }
+        }
+
+        // Apply: transfer balances and cancel sources
+        let mut target_vault = Self::load_vault(&env, target_vault_id);
+        for source_id in source_vault_ids.iter() {
+            let mut source = Self::load_vault(&env, source_id);
+            target_vault.balance = target_vault.balance
+                .checked_add(source.balance)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
+            source.balance = 0;
+            source.status = ReleaseStatus::Cancelled;
+            Self::save_vault(&env, source_id, &source);
+            Self::remove_owner_vault_id(&env, &source.owner, source_id, source.check_in_interval);
+            Self::remove_beneficiary_vault_id(&env, &source.beneficiary, source_id, source.check_in_interval);
+            Self::append_activity_log(&env, source_id, "merge_vaults_source", &caller, "");
+        }
+        Self::save_vault(&env, target_vault_id, &target_vault);
+        Self::append_activity_log(&env, target_vault_id, "merge_vaults_target", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VAULT_MERGED_TOPIC,), (target_vault_id, source_vault_ids));
+        Ok(())
     }
 
     // --- Issue #386: Vault Expiry Notification Events ---
