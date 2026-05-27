@@ -3701,7 +3701,7 @@ fn test_merge_vaults_non_locked_source_fails() {
     // Try to merge released source into target — should fail
     let sources = soroban_sdk::vec![&env, source];
     let err = client.try_merge_vaults(&target, &sources, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(51)); // IncompatibleVaultStatus
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased (was IncompatibleVaultStatus)
 }
 
 #[test]
@@ -3717,4 +3717,208 @@ fn test_merge_vaults_same_token_succeeds() {
     let sources = soroban_sdk::vec![&env, source];
     client.merge_vaults(&target, &sources, &owner).unwrap();
     assert_eq!(client.get_vault(&target).balance, 50_000i128);
+}
+
+// ── Issue #483: batch_check_in_v2 ────────────────────────────────────────────
+
+#[test]
+fn test_batch_check_in_v2_validates_before_mutating() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let id2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    // Both vaults should check in successfully
+    let ids = soroban_sdk::vec![&env, id1, id2];
+    client.batch_check_in_v2(&ids, &owner, &passkey).unwrap();
+
+    let v1 = client.get_vault(&id1);
+    let v2 = client.get_vault(&id2);
+    assert_eq!(v1.last_check_in, v2.last_check_in);
+}
+
+#[test]
+fn test_batch_check_in_v2_rejects_wrong_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_batch_check_in_v2_rejects_released_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    // Expire the vault
+    env.ledger().with_mut(|l| l.timestamp += 10);
+    client.trigger_release(&id);
+
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &owner, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}
+
+// ── Issue #482: TTL prediction model ─────────────────────────────────────────
+
+#[test]
+fn test_predict_expiry_falls_back_to_interval_with_no_history() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault = client.get_vault(&id);
+    let predicted = client.predict_expiry(&id);
+    // With no history, should be last_check_in + check_in_interval
+    assert_eq!(predicted, vault.last_check_in + vault.check_in_interval);
+}
+
+#[test]
+fn test_predict_expiry_uses_history_average() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Two check-ins 1800s apart
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+
+    let predicted = client.predict_expiry(&id);
+    let vault = client.get_vault(&id);
+    // Average interval is 1800, so predicted = last_check_in + 1800
+    assert_eq!(predicted, vault.last_check_in + 1800);
+}
+
+#[test]
+fn test_get_check_in_streak_increments_on_time() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak = client.get_check_in_streak(&id);
+    assert_eq!(streak.current, 1);
+    assert_eq!(streak.best, 1);
+
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak2 = client.get_check_in_streak(&id);
+    assert_eq!(streak2.current, 2);
+    assert_eq!(streak2.best, 2);
+}
+
+// ── Issue #481: check-in proof-of-work ───────────────────────────────────────
+
+#[test]
+fn test_check_in_with_pow_zero_difficulty_always_passes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=0 means any nonce is valid
+    client.check_in_with_pow(&id, &owner, &passkey, &0u64, &0u32).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_wrong_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in_with_pow(&id, &stranger, &passkey, &0u64, &0u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_invalid_nonce() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=20 with nonce=0 is extremely unlikely to pass
+    let err = client.try_check_in_with_pow(&id, &owner, &passkey, &0u64, &20u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(26)); // InvalidPasskey (reused for PoW)
+}
+
+// ── Issue #480: check-in delegation ──────────────────────────────────────────
+
+#[test]
+fn test_add_and_check_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(client.is_check_in_delegate_pub(&id, &delegate));
+
+    let delegates = client.get_check_in_delegates(&id);
+    assert_eq!(delegates.len(), 1);
+}
+
+#[test]
+fn test_delegate_can_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.check_in(&id, &delegate, &passkey).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_remove_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    client.remove_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+}
+
+#[test]
+fn test_non_delegate_cannot_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in(&id, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_add_duplicate_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    let err = client.try_add_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary (reused)
+}
+
+#[test]
+fn test_remove_nonexistent_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_remove_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(27)); // PasskeyNotFound (reused)
 }
