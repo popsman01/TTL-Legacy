@@ -392,3 +392,44 @@ pub enum ProposalStatus {
     Executed,
     Expired,
 }
+
+/// State transition record for vault status changes - Issue #472
+#[contracttype]
+#[derive(Clone)]
+pub struct StateTransitionEntry {
+    pub from_status: ReleaseStatus,
+    pub to_status: ReleaseStatus,
+    pub actor: Address,
+    pub timestamp: u64,
+}
+
+/// Ownership proof result - Issue #473
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipProof {
+    pub vault_id: u64,
+    pub owner_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub is_active: bool,
+}
+
+/// Vault integrity report - Issue #474
+#[contracttype]
+#[derive(Clone)]
+pub struct IntegrityReport {
+    pub vault_id: u64,
+    pub checksum: BytesN<32>,
+    pub is_valid: bool,
+    pub timestamp: u64,
+}
+
+/// Vault status summary for batch queries - Issue #475
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
+    pub last_check_in: u64,
+    pub is_expired: bool,
+}
