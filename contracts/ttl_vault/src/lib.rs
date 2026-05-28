@@ -3943,6 +3943,109 @@ impl TtlVaultContract {
         }
     }
 
+    // --- Issue #550: Passkey Compromise Detection ---
+
+    /// Reports a passkey as compromised. Subsequent check-ins using that hash
+    /// will be rejected with `PasskeyCompromised`.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - Caller is not the vault owner
+    pub fn report_passkey_compromise(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::CompromisedPasskeys(vault_id);
+        let mut set: Vec<BytesN<32>> = env
+            .storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Idempotent — don't add duplicates.
+        if !set.iter().any(|h| h == passkey_hash) {
+            set.push_back(passkey_hash.clone());
+            let ttl = vault_ttl_ledgers(vault.check_in_interval);
+            env.storage().persistent().set(&key, &set);
+            env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((PASSKEY_COMPROMISED_TOPIC, vault_id), passkey_hash);
+        Ok(())
+    }
+
+    /// Clears a previously reported passkey compromise, allowing the passkey to be used again.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - Caller is not the vault owner
+    pub fn clear_passkey_compromise(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::CompromisedPasskeys(vault_id);
+        let set: Vec<BytesN<32>> = env
+            .storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_set: Vec<BytesN<32>> = Vec::new(&env);
+        for h in set.iter() {
+            if h != passkey_hash {
+                new_set.push_back(h);
+            }
+        }
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &new_set);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Returns whether a passkey has been flagged as compromised for a vault.
+    pub fn is_passkey_compromised(env: Env, vault_id: u64, passkey_hash: BytesN<32>) -> bool {
+        let key = DataKey::CompromisedPasskeys(vault_id);
+        let set: Vec<BytesN<32>> = env
+            .storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        set.iter().any(|h| h == passkey_hash)
+    }
+
+    /// Inspects the recent passkey usage log and emits a `pk_comp` advisory event
+    /// if 3 or more of the last 5 entries used different passkey hashes.
+    fn detect_passkey_anomaly(env: &Env, vault_id: u64, current_hash: &BytesN<32>) {
+        let usage: Vec<PasskeyUsageEntry> = env
+            .storage().persistent()
+            .get(&DataKey::PasskeyUsage(vault_id))
+            .unwrap_or_else(|| Vec::new(env));
+        if usage.len() < 3 {
+            return;
+        }
+        let window_start = usage.len().saturating_sub(5);
+        let mut distinct = 0u32;
+        let mut prev: Option<BytesN<32>> = None;
+        for i in window_start..usage.len() {
+            let entry = usage.get(i as u32).unwrap();
+            if prev.as_ref() != Some(&entry.passkey_hash) {
+                distinct += 1;
+                prev = Some(entry.passkey_hash.clone());
+            }
+        }
+        if distinct >= 3 {
+            env.events().publish((PASSKEY_COMPROMISED_TOPIC, vault_id), current_hash.clone());
+        }
+    }
+
     // --- Issue #549: Passkey Expiry Enforcement ---
 
     /// Validates that `passkey_hash` is registered for `vault_id` and not expired.
@@ -3981,6 +4084,19 @@ impl TtlVaultContract {
         }
         // else: no passkey configured — any hash accepted for backwards compat.
 
+        // Issue #550: block check-in if passkey is flagged as compromised.
+        {
+            let comp_key = DataKey::CompromisedPasskeys(vault_id);
+            let compromised: Vec<BytesN<32>> = env
+                .storage().persistent()
+                .get(&comp_key)
+                .unwrap_or_else(|| Vec::new(env));
+            if compromised.iter().any(|h| &h == passkey_hash) {
+                env.events().publish((PASSKEY_COMPROMISED_TOPIC, vault_id), passkey_hash.clone());
+                return Err(ContractError::PasskeyCompromised);
+            }
+        }
+
         // Expiry check — applies regardless of registration path.
         if let Some(expiry) = env.storage().persistent()
             .get::<DataKey, u64>(&DataKey::PasskeyExpiry(vault_id, passkey_hash.clone()))
@@ -3996,19 +4112,22 @@ impl TtlVaultContract {
 
     // --- Issue #395: Passkey Usage Analytics ---
 
-    /// Logs a passkey usage entry for a vault check-in
+    /// Logs a passkey usage entry for a vault check-in and runs anomaly detection.
     fn log_passkey_usage(env: &Env, vault_id: u64, passkey_hash: &BytesN<32>, timestamp: u64) {
         let mut usage: Vec<PasskeyUsageEntry> = env
             .storage()
             .persistent()
             .get(&DataKey::PasskeyUsage(vault_id))
             .unwrap_or(Vec::new(env));
-        
+
+        // Issue #550: detect anomalous passkey switching before appending this entry.
+        Self::detect_passkey_anomaly(env, vault_id, passkey_hash);
+
         usage.push_back(PasskeyUsageEntry {
             passkey_hash: passkey_hash.clone(),
             timestamp,
         });
-        
+
         let key = DataKey::PasskeyUsage(vault_id);
         env.storage().persistent().set(&key, &usage);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
