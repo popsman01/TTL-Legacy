@@ -38,6 +38,7 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    EMERGENCY_FREEZE_TOPIC, FREEZE_RESOLVED_TOPIC,
 };
 
 #[cfg(test)]
@@ -148,6 +149,7 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    VaultFrozen = 55,
 }
 
 #[contract]
@@ -944,6 +946,9 @@ impl TtlVaultContract {
             }
             if caller != vault.owner {
                 return Err(ContractError::NotOwner);
+            }
+            if vault.status == ReleaseStatus::EmergencyFrozen {
+                return Err(ContractError::VaultFrozen);
             }
             if vault.status != ReleaseStatus::Locked {
                 return Err(ContractError::AlreadyReleased);
@@ -2412,6 +2417,9 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
+        if vault.status == ReleaseStatus::EmergencyFrozen {
+            return Err(ContractError::VaultFrozen);
+        }
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
@@ -2565,6 +2573,9 @@ impl TtlVaultContract {
         let mut vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
+        }
+        if vault.status == ReleaseStatus::EmergencyFrozen {
+            return Err(ContractError::VaultFrozen);
         }
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
@@ -5837,5 +5848,64 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Emergency Freeze ─────────────────────────────────────────────────────
+
+    /// Freezes a vault in response to a suspected owner compromise.
+    ///
+    /// Only the vault's primary beneficiary (or a listed multi-beneficiary) may
+    /// call this. While frozen, all owner-only operations (withdraw,
+    /// update_beneficiary, cancel_vault) are blocked.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to freeze
+    /// * `caller`   - Must be a beneficiary of the vault (requires auth)
+    ///
+    /// # Errors
+    /// * `ContractError::NotBeneficiary` - If caller is not a beneficiary
+    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    pub fn emergency_freeze(env: Env, vault_id: u64, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        let is_beneficiary = caller == vault.beneficiary
+            || vault.beneficiaries.iter().any(|e| e.address == caller);
+        if !is_beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        vault.status = ReleaseStatus::EmergencyFrozen;
+        Self::save_vault(&env, vault_id, &vault);
+        Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::EmergencyFrozen, &caller);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((EMERGENCY_FREEZE_TOPIC, vault_id), caller);
+        Ok(())
+    }
+
+    /// Resolves an emergency freeze, returning the vault to Locked status.
+    ///
+    /// Only the contract admin may call this after investigating the situation.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to unfreeze
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin`       - If caller is not the admin
+    /// * `ContractError::AlreadyReleased` - If vault is not EmergencyFrozen
+    pub fn resolve_emergency_freeze(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::EmergencyFrozen {
+            return Err(ContractError::AlreadyReleased);
+        }
+        vault.status = ReleaseStatus::Locked;
+        let admin = Self::load_admin(&env);
+        Self::save_vault(&env, vault_id, &vault);
+        Self::record_state_transition(&env, vault_id, ReleaseStatus::EmergencyFrozen, ReleaseStatus::Locked, &admin);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((FREEZE_RESOLVED_TOPIC, vault_id), admin);
+        Ok(())
     }
 }

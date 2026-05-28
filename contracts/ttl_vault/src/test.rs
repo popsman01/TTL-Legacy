@@ -4082,3 +4082,116 @@ fn test_get_release_votes_empty_by_default() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
+
+// ── Emergency Freeze Tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_emergency_freeze_by_beneficiary() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.status, ReleaseStatus::EmergencyFrozen);
+}
+
+#[test]
+fn test_emergency_freeze_blocks_withdraw() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+    client.emergency_freeze(&id, &beneficiary);
+    let err = client.try_withdraw(&id, &owner, &500).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // VaultFrozen
+}
+
+#[test]
+fn test_emergency_freeze_blocks_update_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_ben = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    let err = client.try_update_beneficiary(&id, &owner, &new_ben).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // VaultFrozen
+}
+
+#[test]
+fn test_emergency_freeze_blocks_cancel_vault() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    let err = client.try_cancel_vault(&id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // VaultFrozen
+}
+
+#[test]
+fn test_emergency_freeze_non_beneficiary_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_emergency_freeze(&id, &stranger).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(30)); // NotBeneficiary
+}
+
+#[test]
+fn test_resolve_emergency_freeze_by_admin() {
+    let (_, owner, beneficiary, admin, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    client.resolve_emergency_freeze(&id);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_resolve_emergency_freeze_restores_withdraw() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+    client.emergency_freeze(&id, &beneficiary);
+    client.resolve_emergency_freeze(&id);
+    client.withdraw(&id, &owner, &500);
+    assert_eq!(client.get_vault(&id).balance, 500);
+}
+
+#[test]
+fn test_resolve_emergency_freeze_non_frozen_rejected() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_resolve_emergency_freeze(&id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}
+
+#[test]
+fn test_emergency_freeze_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == symbol_short!("emg_frz")).unwrap_or(false)
+        }
+    });
+    assert!(found, "EMERGENCY_FREEZE_TOPIC event not emitted");
+}
+
+#[test]
+fn test_freeze_resolved_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.emergency_freeze(&id, &beneficiary);
+    client.resolve_emergency_freeze(&id);
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == symbol_short!("frz_res")).unwrap_or(false)
+        }
+    });
+    assert!(found, "FREEZE_RESOLVED_TOPIC event not emitted");
+}
